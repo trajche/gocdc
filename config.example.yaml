@@ -1,0 +1,43 @@
+source:
+  addr: "127.0.0.1:3306"
+  user: "root"
+  password: ""
+  database: "mydb"
+  flavor: "mariadb"   # or "mysql"
+  server_id: 101
+
+# Multiple sinks — every row event is fanned out to all sinks.
+sinks:
+  - type: "postgres"
+    dsn: "postgres://user@127.0.0.1:5432/mydb?sslmode=disable"
+    schema: "cdc"
+
+  # - type: "redis"
+  #   addr: "127.0.0.1:6379"
+  #   password: ""
+  #   db: 0
+  #   prefix: "cdc"
+
+  # - type: "redis-json"
+  #   addr: "127.0.0.1:6379"
+  #   prefix: "cdc"
+
+  # - type: "stdout"
+
+batch_size: 1000
+flush_interval: "500ms"
+checkpoint_file: "checkpoint.json"
+
+tables:
+  - source: "users"
+    target: "users"
+    primary_key: ["id"]
+    columns:
+      - { source: "id",    target: "id" }
+      - { source: "name",  target: "name" }
+      - { source: "email", target: "email" }
+    # snapshot_filter: "active = 1"
+    # stream_filter:
+    #   column: "status"
+    #   values: ["active", "pending"]
+    #   pattern: "prefix_%"    # SQL LIKE pattern (alternative to values)
