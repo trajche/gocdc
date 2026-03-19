@@ -7,22 +7,39 @@ source:
   server_id: 101
 
 # Multiple sinks — every row event is fanned out to all sinks.
+# Each sink has its own mode:
+#   "upsert" (default) — compact, latest state only (ON CONFLICT DO UPDATE)
+#   "log"              — append-only changelog (Flink-style +I/-U/+U/-D events)
 sinks:
   - type: "postgres"
+    mode: "upsert"
     dsn: "postgres://user@127.0.0.1:5432/mydb?sslmode=disable"
     schema: "cdc"
 
+  # Append-only event log in a separate schema
+  # - type: "postgres"
+  #   mode: "log"
+  #   dsn: "postgres://user@127.0.0.1:5432/mydb?sslmode=disable"
+  #   schema: "cdc_log"
+
   # - type: "redis"
+  #   mode: "upsert"       # HSET per row
   #   addr: "127.0.0.1:6379"
   #   password: ""
   #   db: 0
   #   prefix: "cdc"
 
+  # - type: "redis"
+  #   mode: "log"           # RPUSH JSON events to {prefix}:{table}:{pk}:log
+  #   addr: "127.0.0.1:6379"
+  #   prefix: "cdc_log"
+
   # - type: "redis-json"
+  #   mode: "upsert"
   #   addr: "127.0.0.1:6379"
   #   prefix: "cdc"
 
-  # - type: "stdout"
+  # - type: "stdout"        # JSON lines — always emits all event kinds
 
 batch_size: 1000
 flush_interval: "500ms"

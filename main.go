@@ -51,21 +51,20 @@ func saveCheckpoint(path string, cp Checkpoint) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// pendingRow holds a row event to be flushed to the sink.
-type pendingRow struct {
-	table  *TableConfig
-	values []interface{} // mapped column values in target order
-	delete bool
-	pkVals []interface{} // only set for deletes
+// configuredSink pairs a Sink with its mode from config.
+type configuredSink struct {
+	sink Sink
+	mode SinkMode
+	cfg  SinkConfig
 }
 
 // CDCHandler implements canal.EventHandler.
 type CDCHandler struct {
 	mu       sync.Mutex
 	cfg      *Config
-	sinks    []Sink
+	sinks    []configuredSink
 	tableMap map[string]*TableConfig // source table name → config
-	batch    []pendingRow
+	batch    []CDCRow
 	pos      mysql.Position
 	ctx      context.Context
 }
@@ -83,27 +82,46 @@ func (h *CDCHandler) OnRow(e *canal.RowsEvent) error {
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			if mapped, ok := h.mapRow(tc, row); ok {
-				h.batch = append(h.batch, pendingRow{table: tc, values: mapped})
+			if mapped, pkVals, ok := h.mapRow(tc, row); ok {
+				h.batch = append(h.batch, CDCRow{
+					Table: tc, Kind: RowKindInsert, Values: mapped, PKVals: pkVals,
+				})
 			}
 		}
 	case canal.UpdateAction:
 		// e.Rows alternates [before, after, before, after, ...]
-		for i := 1; i < len(e.Rows); i += 2 {
-			row := e.Rows[i]
-			if mapped, ok := h.mapRow(tc, row); ok {
-				h.batch = append(h.batch, pendingRow{table: tc, values: mapped})
+		for i := 0; i+1 < len(e.Rows); i += 2 {
+			before := e.Rows[i]
+			after := e.Rows[i+1]
+
+			mappedBefore, pkValsBefore, okBefore := h.mapRow(tc, before)
+			mappedAfter, pkValsAfter, okAfter := h.mapRow(tc, after)
+
+			// For log mode we emit both; for upsert mode the sink ignores -U
+			if okBefore {
+				h.batch = append(h.batch, CDCRow{
+					Table: tc, Kind: RowKindUpdateBefore, Values: mappedBefore, PKVals: pkValsBefore,
+				})
+			}
+			if okAfter {
+				h.batch = append(h.batch, CDCRow{
+					Table: tc, Kind: RowKindUpdateAfter, Values: mappedAfter, PKVals: pkValsAfter,
+				})
 			}
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			pkVals := make([]interface{}, len(tc.PKOrdinals))
-			for i, idx := range tc.PKOrdinals {
-				if idx < len(row) {
-					pkVals[i] = toString(row[idx])
+			mapped, pkVals, ok := h.mapRow(tc, row)
+			if !ok {
+				// Still extract PKs for delete even if filter doesn't match values
+				pkVals = extractPKVals(tc, row)
+				if pkVals == nil {
+					continue
 				}
 			}
-			h.batch = append(h.batch, pendingRow{table: tc, delete: true, pkVals: pkVals})
+			h.batch = append(h.batch, CDCRow{
+				Table: tc, Kind: RowKindDelete, Values: mapped, PKVals: pkVals,
+			})
 		}
 	}
 
@@ -113,16 +131,27 @@ func (h *CDCHandler) OnRow(e *canal.RowsEvent) error {
 	return nil
 }
 
+func extractPKVals(tc *TableConfig, row []interface{}) []interface{} {
+	pkVals := make([]interface{}, len(tc.PKOrdinals))
+	for i, idx := range tc.PKOrdinals {
+		if idx < len(row) {
+			pkVals[i] = toString(row[idx])
+		}
+	}
+	return pkVals
+}
+
 // mapRow extracts configured columns from a binlog row and applies stream filters.
-func (h *CDCHandler) mapRow(tc *TableConfig, row []interface{}) ([]interface{}, bool) {
+// Returns (values, pkVals, matched).
+func (h *CDCHandler) mapRow(tc *TableConfig, row []interface{}) ([]interface{}, []interface{}, bool) {
 	// Apply stream filter
 	if tc.StreamFilter.Column != "" {
 		idx, ok := tc.ColIndex[tc.StreamFilter.Column]
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
 		if idx >= len(row) {
-			return nil, false
+			return nil, nil, false
 		}
 		val := toString(row[idx])
 
@@ -135,13 +164,13 @@ func (h *CDCHandler) mapRow(tc *TableConfig, row []interface{}) ([]interface{}, 
 				}
 			}
 			if !matched {
-				return nil, false
+				return nil, nil, false
 			}
 		}
 
 		if tc.StreamFilter.Pattern != "" {
 			if !matchLike(val, tc.StreamFilter.Pattern) {
-				return nil, false
+				return nil, nil, false
 			}
 		}
 	}
@@ -154,7 +183,15 @@ func (h *CDCHandler) mapRow(tc *TableConfig, row []interface{}) ([]interface{}, 
 			mapped[i] = nil
 		}
 	}
-	return mapped, true
+
+	pkVals := make([]interface{}, len(tc.PKOrdinals))
+	for i, idx := range tc.PKOrdinals {
+		if idx < len(row) {
+			pkVals[i] = toString(row[idx])
+		}
+	}
+
+	return mapped, pkVals, true
 }
 
 // toString converts a binlog row value to a string, handling []byte properly.
@@ -170,11 +207,8 @@ func toString(v interface{}) string {
 
 // matchLike does a simple SQL LIKE match (only supports % and _ wildcards).
 func matchLike(val, pattern string) bool {
-	// Convert SQL LIKE pattern to a simple check
-	// pa_% → strings.HasPrefix(val, "pa_")
 	if strings.HasSuffix(pattern, "%") && !strings.Contains(pattern[:len(pattern)-1], "%") {
 		prefix := strings.ReplaceAll(pattern[:len(pattern)-1], "_", "?")
-		// Simple prefix match (treat _ as literal for now since our patterns use it literally)
 		prefix = strings.ReplaceAll(prefix, "?", "_")
 		return strings.HasPrefix(val, prefix)
 	}
@@ -186,35 +220,13 @@ func (h *CDCHandler) flushLocked() error {
 		return nil
 	}
 
-	// Group by table and operation
-	upserts := make(map[string][][]interface{})
-	deletes := make(map[string][][]interface{})
-	tableRef := make(map[string]*TableConfig)
-
-	for _, p := range h.batch {
-		key := p.table.Source
-		tableRef[key] = p.table
-		if p.delete {
-			deletes[key] = append(deletes[key], p.pkVals)
-		} else {
-			upserts[key] = append(upserts[key], p.values)
+	for _, cs := range h.sinks {
+		if err := cs.sink.WriteBatch(h.ctx, h.batch, cs.mode); err != nil {
+			return fmt.Errorf("write batch: %w", err)
 		}
 	}
 
-	for _, sink := range h.sinks {
-		for key, rows := range upserts {
-			if err := sink.Upsert(h.ctx, tableRef[key], rows); err != nil {
-				return fmt.Errorf("upsert %s: %w", key, err)
-			}
-		}
-		for key, keys := range deletes {
-			if err := sink.Delete(h.ctx, tableRef[key], keys); err != nil {
-				return fmt.Errorf("delete %s: %w", key, err)
-			}
-		}
-	}
-
-	log.Printf("flushed %d rows (pos: %s:%d)", len(h.batch), h.pos.Name, h.pos.Pos)
+	log.Printf("flushed %d events (pos: %s:%d)", len(h.batch), h.pos.Name, h.pos.Pos)
 	h.batch = h.batch[:0]
 	return nil
 }
@@ -286,25 +298,26 @@ func main() {
 		log.Fatal("no sinks configured")
 	}
 
-	var sinks []Sink
+	var sinks []configuredSink
 	for _, sc := range sinkConfigs {
 		s, err := createSink(ctx, sc)
 		if err != nil {
 			log.Fatalf("create %s sink: %v", sc.Type, err)
 		}
-		sinks = append(sinks, s)
-		log.Printf("connected to %s sink", sc.Type)
+		mode := sc.EffectiveMode()
+		sinks = append(sinks, configuredSink{sink: s, mode: mode, cfg: sc})
+		log.Printf("connected to %s sink (mode: %s)", sc.Type, mode)
 	}
 	defer func() {
-		for _, s := range sinks {
-			s.Close()
+		for _, cs := range sinks {
+			cs.sink.Close()
 		}
 	}()
 
 	// Ensure target tables exist in all sinks
-	for _, s := range sinks {
+	for _, cs := range sinks {
 		for i := range cfg.Tables {
-			if err := s.EnsureTable(ctx, &cfg.Tables[i]); err != nil {
+			if err := cs.sink.EnsureTable(ctx, &cfg.Tables[i], cs.mode); err != nil {
 				log.Fatalf("ensure table %s: %v", cfg.Tables[i].Target, err)
 			}
 		}
@@ -390,9 +403,6 @@ func main() {
 		startPos = mysql.Position{Name: cp.File, Pos: cp.Pos}
 		log.Printf("resuming from checkpoint %s:%d", cp.File, cp.Pos)
 	} else {
-		// Get current binlog position (after snapshot)
-		// We query directly because go-mysql's GetMasterPos() uses
-		// SHOW BINARY LOG STATUS which MariaDB doesn't support.
 		pos, err := getMasterPos(cfg)
 		if err != nil {
 			log.Fatalf("get master pos: %v", err)
@@ -434,7 +444,6 @@ func main() {
 	}()
 
 	if err := c.RunFrom(startPos); err != nil {
-		// canal.Close() causes ErrClosed which is expected on shutdown
 		if ctx.Err() == nil {
 			log.Fatalf("canal: %v", err)
 		}
@@ -491,26 +500,21 @@ func getMasterPos(cfg *Config) (mysql.Position, error) {
 		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS returned no rows")
 	}
 
-	// MariaDB returns 4 columns, MySQL returns 5 — scan dynamically
 	vals := make([]interface{}, len(cols))
 	for i := range vals {
 		vals[i] = new(sql.NullString)
 	}
-	err = rows.Scan(vals...)
-	if err != nil {
+	if err := rows.Scan(vals...); err != nil {
 		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS scan: %w", err)
 	}
 
 	file := vals[0].(*sql.NullString).String
 	var pos uint32
 	fmt.Sscanf(vals[1].(*sql.NullString).String, "%d", &pos)
-	if err != nil {
-		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS: %w", err)
-	}
 	return mysql.Position{Name: file, Pos: pos}, nil
 }
 
-func runSnapshot(ctx context.Context, cfg *Config, sinks []Sink) error {
+func runSnapshot(ctx context.Context, cfg *Config, sinks []configuredSink) error {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", cfg.Source.User, cfg.Source.Password, cfg.Source.Addr, cfg.Source.Database)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -527,14 +531,12 @@ func runSnapshot(ctx context.Context, cfg *Config, sinks []Sink) error {
 	return nil
 }
 
-func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig, sinks []Sink) error {
-	// Build SELECT column list
+func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig, sinks []configuredSink) error {
 	srcCols := make([]string, len(t.Columns))
 	for i, cm := range t.Columns {
 		srcCols[i] = cm.Source
 	}
 
-	// For chunked reads, use the first PK column
 	pkCol := t.PrimaryKey[0]
 	var lastPK interface{} = 0
 
@@ -552,7 +554,7 @@ func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig,
 			return fmt.Errorf("query: %w", err)
 		}
 
-		var batch [][]interface{}
+		var batch []CDCRow
 		for rows.Next() {
 			vals := make([]interface{}, len(srcCols))
 			ptrs := make([]interface{}, len(srcCols))
@@ -564,7 +566,6 @@ func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig,
 				return fmt.Errorf("scan: %w", err)
 			}
 
-			// Convert to string representations
 			strVals := make([]interface{}, len(vals))
 			for i, v := range vals {
 				if v == nil {
@@ -575,10 +576,23 @@ func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig,
 					strVals[i] = fmt.Sprintf("%v", v)
 				}
 			}
-			batch = append(batch, strVals)
 
-			// Track last PK for pagination (first column is always the PK in srcCols for single-PK tables)
-			// Find PK index in srcCols
+			// Extract PK values
+			pkTargets := pkTargetNames(t)
+			pkVals := make([]interface{}, len(pkTargets))
+			for i, pk := range t.PrimaryKey {
+				for j, col := range srcCols {
+					if col == pk {
+						pkVals[i] = strVals[j]
+						break
+					}
+				}
+			}
+
+			batch = append(batch, CDCRow{
+				Table: t, Kind: RowKindInsert, Values: strVals, PKVals: pkVals,
+			})
+
 			for j, col := range srcCols {
 				if col == pkCol {
 					lastPK = vals[j]
@@ -592,9 +606,9 @@ func snapshotTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableConfig,
 			break
 		}
 
-		for _, sink := range sinks {
-			if err := sink.Upsert(ctx, t, batch); err != nil {
-				return fmt.Errorf("upsert: %w", err)
+		for _, cs := range sinks {
+			if err := cs.sink.WriteBatch(ctx, batch, cs.mode); err != nil {
+				return fmt.Errorf("write batch: %w", err)
 			}
 		}
 

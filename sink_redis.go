@@ -11,8 +11,8 @@ import (
 )
 
 // RedisSink writes CDC rows to Redis as hash keys.
-// Key format: {prefix}:{table}:{pk1}:{pk2}:...
-// Each hash contains the mapped column values plus _cdc_operation and _cdc_timestamp.
+// In upsert mode: HSET for inserts/updates, DEL for deletes.
+// In log mode: RPUSH a JSON event onto a list key {prefix}:{table}:{pk}:log
 type RedisSink struct {
 	client *redis.Client
 	prefix string
@@ -37,56 +37,84 @@ func (s *RedisSink) Close() {
 	s.client.Close()
 }
 
-func (s *RedisSink) EnsureTable(_ context.Context, _ *TableConfig) error {
-	// Redis is schema-less — nothing to prepare.
+func (s *RedisSink) EnsureTable(_ context.Context, _ *TableConfig, _ SinkMode) error {
 	return nil
 }
 
-func (s *RedisSink) Upsert(ctx context.Context, t *TableConfig, rows [][]interface{}) error {
+func (s *RedisSink) WriteBatch(ctx context.Context, rows []CDCRow, mode SinkMode) error {
 	if len(rows) == 0 {
 		return nil
 	}
+	if mode == SinkModeLog {
+		return s.writeLog(ctx, rows)
+	}
+	return s.writeUpsert(ctx, rows)
+}
 
+func (s *RedisSink) writeUpsert(ctx context.Context, rows []CDCRow) error {
 	pipe := s.client.Pipeline()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	for _, row := range rows {
-		key := s.buildKey(t, row)
-		fields := make(map[string]interface{}, len(t.Columns)+2)
-		for i, cm := range t.Columns {
-			v := sanitizeValue(row[i])
-			if v == nil {
-				fields[cm.Target] = ""
-			} else {
-				fields[cm.Target] = v
+	for _, r := range rows {
+		switch r.Kind {
+		case RowKindInsert, RowKindUpdateAfter:
+			key := s.buildKeyFromRow(r.Table, r.Values)
+			fields := make(map[string]interface{}, len(r.Table.Columns)+2)
+			for i, cm := range r.Table.Columns {
+				v := sanitizeValue(r.Values[i])
+				if v == nil {
+					fields[cm.Target] = ""
+				} else {
+					fields[cm.Target] = v
+				}
+			}
+			fields["_cdc_operation"] = string(r.Kind)
+			fields["_cdc_timestamp"] = now
+			pipe.HSet(ctx, key, fields)
+		case RowKindDelete:
+			key := s.buildKeyFromPK(r.Table, r.PKVals)
+			pipe.Del(ctx, key)
+		}
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (s *RedisSink) writeLog(ctx context.Context, rows []CDCRow) error {
+	pipe := s.client.Pipeline()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	for _, r := range rows {
+		listKey := s.buildKeyFromPK(r.Table, r.PKVals) + ":log"
+		event := map[string]interface{}{
+			"_cdc_kind":      string(r.Kind),
+			"_cdc_timestamp": now,
+		}
+		if r.Values != nil {
+			for i, cm := range r.Table.Columns {
+				event[cm.Target] = sanitizeValue(r.Values[i])
+			}
+		} else {
+			pkTargets := pkTargetNames(r.Table)
+			for i, name := range pkTargets {
+				if i < len(r.PKVals) {
+					event[name] = r.PKVals[i]
+				}
 			}
 		}
-		fields["_cdc_operation"] = "upsert"
-		fields["_cdc_timestamp"] = now
-		pipe.HSet(ctx, key, fields)
+		data, err := json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("marshal: %w", err)
+		}
+		pipe.RPush(ctx, listKey, data)
 	}
 
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
-func (s *RedisSink) Delete(ctx context.Context, t *TableConfig, keys [][]interface{}) error {
-	if len(keys) == 0 {
-		return nil
-	}
-
-	pipe := s.client.Pipeline()
-	for _, pkVals := range keys {
-		key := s.buildKeyFromPK(t, pkVals)
-		pipe.Del(ctx, key)
-	}
-
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
-// buildKey constructs the Redis key from a full row using PK column positions.
-func (s *RedisSink) buildKey(t *TableConfig, row []interface{}) string {
+func (s *RedisSink) buildKeyFromRow(t *TableConfig, row []interface{}) string {
 	pkParts := make([]string, len(t.PrimaryKey))
 	for i, pk := range t.PrimaryKey {
 		for j, cm := range t.Columns {
@@ -104,7 +132,6 @@ func (s *RedisSink) buildKey(t *TableConfig, row []interface{}) string {
 	return s.prefix + ":" + t.Target + ":" + strings.Join(pkParts, ":")
 }
 
-// buildKeyFromPK constructs the Redis key from PK values (used for deletes).
 func (s *RedisSink) buildKeyFromPK(t *TableConfig, pkVals []interface{}) string {
 	parts := make([]string, len(pkVals))
 	for i, v := range pkVals {
@@ -117,9 +144,9 @@ func (s *RedisSink) buildKeyFromPK(t *TableConfig, pkVals []interface{}) string 
 	return s.prefix + ":" + t.Target + ":" + strings.Join(parts, ":")
 }
 
-// RedisJSONSink writes CDC rows to Redis as JSON strings (for use with RedisJSON or
-// applications that prefer GET over HGETALL).
-// Key format: {prefix}:{table}:{pk1}:{pk2}:...
+// RedisJSONSink writes CDC rows as JSON strings.
+// In upsert mode: SET with JSON value.
+// In log mode: same as RedisSink (RPUSH JSON to list).
 type RedisJSONSink struct {
 	RedisSink
 }
@@ -132,29 +159,39 @@ func NewRedisJSONSink(ctx context.Context, addr, password string, db int, prefix
 	return &RedisJSONSink{RedisSink: *base}, nil
 }
 
-func (s *RedisJSONSink) Upsert(ctx context.Context, t *TableConfig, rows [][]interface{}) error {
+func (s *RedisJSONSink) WriteBatch(ctx context.Context, rows []CDCRow, mode SinkMode) error {
 	if len(rows) == 0 {
 		return nil
 	}
+	if mode == SinkModeLog {
+		return s.writeLog(ctx, rows)
+	}
+	return s.writeUpsertJSON(ctx, rows)
+}
 
+func (s *RedisJSONSink) writeUpsertJSON(ctx context.Context, rows []CDCRow) error {
 	pipe := s.client.Pipeline()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	for _, row := range rows {
-		key := s.buildKey(t, row)
-		fields := make(map[string]interface{}, len(t.Columns)+2)
-		for i, cm := range t.Columns {
-			v := sanitizeValue(row[i])
-			fields[cm.Target] = v
+	for _, r := range rows {
+		switch r.Kind {
+		case RowKindInsert, RowKindUpdateAfter:
+			key := s.buildKeyFromRow(r.Table, r.Values)
+			fields := make(map[string]interface{}, len(r.Table.Columns)+2)
+			for i, cm := range r.Table.Columns {
+				fields[cm.Target] = sanitizeValue(r.Values[i])
+			}
+			fields["_cdc_operation"] = string(r.Kind)
+			fields["_cdc_timestamp"] = now
+			data, err := json.Marshal(fields)
+			if err != nil {
+				return fmt.Errorf("marshal: %w", err)
+			}
+			pipe.Set(ctx, key, data, 0)
+		case RowKindDelete:
+			key := s.buildKeyFromPK(r.Table, r.PKVals)
+			pipe.Del(ctx, key)
 		}
-		fields["_cdc_operation"] = "upsert"
-		fields["_cdc_timestamp"] = now
-
-		data, err := json.Marshal(fields)
-		if err != nil {
-			return fmt.Errorf("marshal row: %w", err)
-		}
-		pipe.Set(ctx, key, data, 0)
 	}
 
 	_, err := pipe.Exec(ctx)

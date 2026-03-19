@@ -46,8 +46,9 @@ type SourceConfig struct {
 }
 
 type SinkConfig struct {
-	Type   string `yaml:"type"`   // "postgres", "redis", "redis-json"
-	DSN    string `yaml:"dsn"`    // postgres connection string
+	Type string `yaml:"type"` // "postgres", "redis", "redis-json", "stdout"
+	Mode string `yaml:"mode"` // "upsert" (default) or "log"
+	DSN  string `yaml:"dsn"`  // postgres connection string
 	Schema string `yaml:"schema"` // postgres schema
 
 	// Redis options
@@ -55,6 +56,14 @@ type SinkConfig struct {
 	Password string `yaml:"password"` // redis password
 	DB       int    `yaml:"db"`       // redis database number
 	Prefix   string `yaml:"prefix"`   // redis key prefix (default: "cdc")
+}
+
+// EffectiveMode returns the sink mode, defaulting to "upsert".
+func (sc *SinkConfig) EffectiveMode() SinkMode {
+	if sc.Mode == "log" {
+		return SinkModeLog
+	}
+	return SinkModeUpsert
 }
 
 type Config struct {
